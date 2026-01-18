@@ -4,6 +4,7 @@ import pandas as pd
 import requests
 import re 
 import os 
+import io 
 
 def clean_text(text): 
     """
@@ -16,6 +17,8 @@ def clean_text(text):
     
     #regex to find anything inside brackets and deleting it 
     text = re.sub(r'\[.*?\]', '', text)
+    #remove non-breaking spaces and weird whitespace 
+    text = text.replace('\xa0', ' ') 
     return text.strip()
 
 def ingest_vocab_standards(): 
@@ -25,13 +28,16 @@ def ingest_vocab_standards():
     #set a user agent 
 
     headers = { 
-        'User-Agent' : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrom/114.0.0.0 Safari/537.36'
+        'User-Agent' : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
     }
 
     try: 
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status() 
 
+        #wrap in StringIO 
+        html_data = io.StringIO(response.text)
+    
         #using lxml bc it's highly optimized for M2 chip 
 
         all_tables = pd.read_html(response.text, flavor='lxml')
@@ -39,29 +45,39 @@ def ingest_vocab_standards():
 
         master_data = [] 
 
-        for df in all_tables: 
-            
-            #clean headers, find 'País' 
+        for i, df in enumerate(all_tables): 
+            # converting MultiIndex columns to flat strings (if they exist)
+
+            if isinstance(df.columns, pd.MultiIndex): 
+                df.columns = [' '.join(col).strip() for col in df.columns.values]
+
+            #clean all column names 
             df.columns = [clean_text(str(col)) for col in df.columns]
 
-            #find the 'País' column 
-            pais_col = next((c for c in df.columns if 'País' in c or 'Pais' in c), None)
+            cols_str = " ".join(df.columns).lower() 
 
-            if pais_col:
-                df = df.rename(columns={pais_col: 'Country'})
+            if 'país' in cols_str or 'pais' in cols_str: 
+                #find the exact name of that column 
+                actual_col = [c for c in df.columns if 'pais' in c.lower()][0]
 
-                #filter out the Wikipedia Article rows that have no data 
-                df = df[~df['Country'].str.contains('Artículo de Wikipedia', na=False)]
+                df = df.rename(columns={actual_col: 'Country'})
 
-                #TRANSFORM from [Country | Bus | Plumber] into [Country | Concept | LocalTerm]
+                #filter out 'Wiki Articles' rows 
+                df = df[~df['Country'].str.contains('Artículo de Wikipedia', na=False,case=False)]
+
+                #melt table 
                 melted = df.melt(id_vars=['Country'], var_name='Concept', value_name='LocalTerm')
                 master_data.append(melted)
 
-            if not master_data: 
-                print("❌ FAILURE: Ingestion layer could not identify linguistic tables.")
-                return
             
-            #Concatenate and apply final filters 
+
+        if not master_data: 
+            print("❌ FAILURE: still no linguistic tables identified")
+            #Debug: show columns of the first 5 tables to see what we're missing 
+
+            print("Debug - Columns of table 0:", all_tables[0].columns.tolist())
+            return
+            
             final_df = pd.concat(master_data, ignore_index=True).dropna()
 
             #clean every cell 
@@ -71,7 +87,7 @@ def ingest_vocab_standards():
             
             #filter for the target markets 
 
-            target_locales = ['México', 'Puerto Rico', 'Gautemala', 'España']
+            target_locales = ['México', 'Puerto Rico', 'Guatemala', 'España']
             final_df = final_df[final_df['Country'].isin(target_locales)]
 
             #save to centralized data directory 
